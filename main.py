@@ -541,26 +541,31 @@ retraining_in_progress = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    global scorer, drive_manager
-    try:
-        scorer = AdvancedRiderEfficiencyScorer()
-        
-        # Initialize Google Drive if credentials exist
-        credentials_file = os.getenv('GOOGLE_CREDENTIALS_FILE', 'credentials.json')
-        training_folder_id = os.getenv('GOOGLE_DRIVE_TRAINING_FOLDER_ID')
-        
-        if os.path.exists(credentials_file) and training_folder_id:
-            drive_manager = GoogleDriveManager(credentials_file, training_folder_id)
-            logger.info("Google Drive integration enabled")
-        else:
-            logger.warning("Google Drive integration disabled - credentials or folder ID missing")
-            
-        logger.info("ML Service started successfully")
-    except Exception as e:
-        logger.error(f"Startup failed: {e}")
-    
-    yield
+global scorer, drive_manager
+try:
+scorer = AdvancedRiderEfficiencyScorer()
+
+
+# Read environment variables
+credentials_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+training_folder_id = os.getenv("GOOGLE_DRIVE_TRAINING_FOLDER_ID")
+
+
+if os.path.exists(credentials_file) and training_folder_id:
+drive_manager = GoogleDriveManager(credentials_file, training_folder_id)
+logger.info("✅ Google Drive integration enabled")
+else:
+logger.warning("⚠️ Google Drive integration disabled - credentials file or folder ID missing")
+
+
+logger.info("ML Service started successfully")
+
+
+except Exception as e:
+logger.error(f"Startup failed: {e}")
+
+
+yield
     
     # Shutdown
     logger.info("Shutting down...")
@@ -817,4 +822,5 @@ async def root():
     }
 
 if __name__ == "__main__":
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
