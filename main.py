@@ -843,36 +843,57 @@ async def smart_process(background_tasks: BackgroundTasks, file: UploadFile = Fi
         else:
             df = pd.read_excel(io.BytesIO(content))
         
-        df.columns = df.columns.str.strip().str.lower()
+        # Clean column names but preserve original casing for matching
+        df.columns = df.columns.str.strip()
         
-        if 'throttle%' not in df.columns:
-            raise HTTPException(status_code=400, detail="Missing 'throttle%' column")
+        # Check for required throttle column
+        throttle_col = None
+        for col in df.columns:
+            if 'throttle%' in col.lower():
+                throttle_col = col
+                break
         
-        # Extract data and predict
-        throttle_data = pd.to_numeric(df['throttle%'], errors='coerce').dropna().tolist()
+        if throttle_col is None:
+            raise HTTPException(status_code=400, detail="Missing throttle% column")
         
+        # Extract throttle data
+        throttle_data = pd.to_numeric(df[throttle_col], errors='coerce').dropna().tolist()
+        
+        # Look for current column (handle case variations for A/a)
         current_data = None
-        if 'current( a )' in df.columns:
-            current_data = pd.to_numeric(df['current( a )'], errors='coerce').dropna().tolist()
+        for col in df.columns:
+            col_lower = col.lower()
+            if 'current(' in col_lower and (' a ' in col_lower or ' A ' in col or 'a )' in col_lower or 'A )' in col):
+                current_data = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
+                break
         
+        # Look for temperature delta
         temp_data = None
-        if 'cell temp delta' in df.columns:
-            temp_data = pd.to_numeric(df['cell temp delta'], errors='coerce').dropna().tolist()
+        for col in df.columns:
+            col_lower = col.lower()
+            if 'temp' in col_lower and 'delta' in col_lower:
+                temp_data = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
+                break
         
+        # Look for SOC data
         soc_data = None
-        soc_columns = ['soc( % )', 'soc(%)', 'soc %', 'soc%', 'soc']
-        for col in soc_columns:
-            if col in df.columns:
+        for col in df.columns:
+            col_lower = col.lower()
+            if 'soc' in col_lower and '%' in col:
                 soc_data = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
                 break
         
-        # Get immediate prediction
+        # Validate we have minimum required data
+        if len(throttle_data) < 5:
+            raise HTTPException(status_code=400, detail="Insufficient throttle data points (need at least 5)")
+        
+        # Get immediate prediction using feature extraction
         prediction_result = scorer.predict_range(throttle_data, current_data, temp_data, soc_data)
         
         # 2. Start background upload & retrain (don't wait for this)
         if drive_manager and not retraining_in_progress:
             background_tasks.add_task(upload_and_retrain_background, file.filename, content)
-            logger.info(f"✅ Started background processing for {file.filename}")
+            logger.info(f"Started background processing for {file.filename}")
         
         # 3. Return immediate response
         return {
@@ -881,7 +902,13 @@ async def smart_process(background_tasks: BackgroundTasks, file: UploadFile = Fi
                 "filename": file.filename,
                 "status": "processed_and_saved", 
                 "background_training": True,
-                "message": "File saved to Google Drive, model improving in background"
+                "message": "File saved to Google Drive, model improving in background",
+                "columns_found": {
+                    "throttle": throttle_col,
+                    "current": "found" if current_data else "not found",
+                    "temperature": "found" if temp_data else "not found", 
+                    "soc": "found" if soc_data else "not found"
+                }
             },
             "timestamp": datetime.now().isoformat(),
             "status": "success"
@@ -892,41 +919,10 @@ async def smart_process(background_tasks: BackgroundTasks, file: UploadFile = Fi
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def upload_and_retrain_background(filename: str, content: bytes):
-    """Background task to upload and retrain."""
-    global retraining_in_progress
-    
-    try:
-        logger.info(f"🚀 Starting background processing for {filename}")
-        
-        # Save to temp file
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1])
-        temp_file.write(content)
-        temp_file.close()
-        
-        # Upload to Google Drive
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        drive_filename = f"{timestamp}_{filename}"
-        drive_file_id = drive_manager.upload_file(temp_file.name, drive_filename)
-        logger.info(f"✅ Uploaded {drive_filename} to Google Drive")
-        
-        # Clean up temp file
-        os.unlink(temp_file.name)
-        
-        # Trigger retraining if not already in progress
-        if not retraining_in_progress:
-            retraining_in_progress = True
-            await retrain_model_background()
-        
-        logger.info(f"✅ Background processing completed for {filename}")
-        
-    except Exception as e:
-        logger.error(f"❌ Background processing failed for {filename}: {e}")
-
-
 if __name__ == "__main__":
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
