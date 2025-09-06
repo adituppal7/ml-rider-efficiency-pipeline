@@ -825,8 +825,108 @@ async def root():
         }
     }
 
+@app.post("/smart-process")
+async def smart_process(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Get prediction AND trigger background retraining in one call."""
+    global retraining_in_progress
+    
+    if scorer is None or scorer.model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    try:
+        # 1. Get immediate prediction from current model
+        content = await file.read()
+        
+        # Process file for prediction
+        if file.filename.lower().endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(content))
+        else:
+            df = pd.read_excel(io.BytesIO(content))
+        
+        df.columns = df.columns.str.strip().str.lower()
+        
+        if 'throttle%' not in df.columns:
+            raise HTTPException(status_code=400, detail="Missing 'throttle%' column")
+        
+        # Extract data and predict
+        throttle_data = pd.to_numeric(df['throttle%'], errors='coerce').dropna().tolist()
+        
+        current_data = None
+        if 'current( a )' in df.columns:
+            current_data = pd.to_numeric(df['current( a )'], errors='coerce').dropna().tolist()
+        
+        temp_data = None
+        if 'cell temp delta' in df.columns:
+            temp_data = pd.to_numeric(df['cell temp delta'], errors='coerce').dropna().tolist()
+        
+        soc_data = None
+        soc_columns = ['soc( % )', 'soc(%)', 'soc %', 'soc%', 'soc']
+        for col in soc_columns:
+            if col in df.columns:
+                soc_data = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
+                break
+        
+        # Get immediate prediction
+        prediction_result = scorer.predict_range(throttle_data, current_data, temp_data, soc_data)
+        
+        # 2. Start background upload & retrain (don't wait for this)
+        if drive_manager and not retraining_in_progress:
+            background_tasks.add_task(upload_and_retrain_background, file.filename, content)
+            logger.info(f"✅ Started background processing for {file.filename}")
+        
+        # 3. Return immediate response
+        return {
+            "prediction": prediction_result,
+            "file_processing": {
+                "filename": file.filename,
+                "status": "processed_and_saved", 
+                "background_training": True,
+                "message": "File saved to Google Drive, model improving in background"
+            },
+            "timestamp": datetime.now().isoformat(),
+            "status": "success"
+        }
+        
+    except Exception as e:
+        logger.error(f"Smart process error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def upload_and_retrain_background(filename: str, content: bytes):
+    """Background task to upload and retrain."""
+    global retraining_in_progress
+    
+    try:
+        logger.info(f"🚀 Starting background processing for {filename}")
+        
+        # Save to temp file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1])
+        temp_file.write(content)
+        temp_file.close()
+        
+        # Upload to Google Drive
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        drive_filename = f"{timestamp}_{filename}"
+        drive_file_id = drive_manager.upload_file(temp_file.name, drive_filename)
+        logger.info(f"✅ Uploaded {drive_filename} to Google Drive")
+        
+        # Clean up temp file
+        os.unlink(temp_file.name)
+        
+        # Trigger retraining if not already in progress
+        if not retraining_in_progress:
+            retraining_in_progress = True
+            await retrain_model_background()
+        
+        logger.info(f"✅ Background processing completed for {filename}")
+        
+    except Exception as e:
+        logger.error(f"❌ Background processing failed for {filename}: {e}")
+
+
 if __name__ == "__main__":
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
