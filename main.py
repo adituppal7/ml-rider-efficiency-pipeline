@@ -842,73 +842,75 @@ async def smart_process(background_tasks: BackgroundTasks, file: UploadFile = Fi
             df = pd.read_csv(io.BytesIO(content))
         else:
             df = pd.read_excel(io.BytesIO(content))
+
+        # Clean column names - EXACT SAME LOGIC AS COLAB
+        df.columns = df.columns.str.strip().str.lower()
         
-        # Clean column names but preserve original casing for matching
-        df.columns = df.columns.str.strip()
+        # Check required columns using SAME logic as training
+        if 'throttle%' not in df.columns:
+            raise HTTPException(status_code=400, detail="Missing 'throttle%' column")
         
-        # Check for required throttle column
-        throttle_col = None
-        for col in df.columns:
-            if 'throttle%' in col.lower():
-                throttle_col = col
-                break
+        # Extract data using EXACT SAME column names as training
+        throttle_data = pd.to_numeric(df['throttle%'], errors='coerce').dropna().tolist()
         
-        if throttle_col is None:
-            raise HTTPException(status_code=400, detail="Missing throttle% column")
-        
-        # Extract throttle data
-        throttle_data = pd.to_numeric(df[throttle_col], errors='coerce').dropna().tolist()
-        
-        # Look for current column (handle case variations for A/a)
         current_data = None
-        for col in df.columns:
-            col_lower = col.lower()
-            if 'current(' in col_lower and (' a ' in col_lower or ' A ' in col or 'a )' in col_lower or 'A )' in col):
-                current_data = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
-                break
+        if 'current( a )' in df.columns:  # This will now match after .lower()
+            current_data = pd.to_numeric(df['current( a )'], errors='coerce').dropna().tolist()
         
-        # Look for temperature delta
         temp_data = None
-        for col in df.columns:
-            col_lower = col.lower()
-            if 'temp' in col_lower and 'delta' in col_lower:
-                temp_data = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
-                break
+        if 'cell temp delta' in df.columns:
+            temp_data = pd.to_numeric(df['cell temp delta'], errors='coerce').dropna().tolist()
         
-        # Look for SOC data
+        # SOC detection using SAME logic as Colab
         soc_data = None
+        soc_column_names = [
+            'soc( % )', 'soc(%)', 'soc %', 'soc%', 'soc',
+            'state of charge', 'state of charge %', 'state of charge(%)',
+            'battery level', 'battery level %', 'battery level(%)',
+            'battery %', 'battery(%)'
+        ]
+        
+        voltage_keywords = ['voltage', 'v)', 'v ', 'cell voltage', 'battery voltage', 'pack_voltage']
+        
+        found_soc_column = None
         for col in df.columns:
             col_lower = col.lower()
-            if 'soc' in col_lower and '%' in col:
-                soc_data = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
+            
+            # Skip voltage-related columns
+            if any(voltage_key in col_lower for voltage_key in voltage_keywords):
+                continue
+            
+            # Check for SOC matches
+            for soc_name in soc_column_names:
+                if soc_name.lower() in col_lower:
+                    found_soc_column = col
+                    break
+            
+            if found_soc_column:
                 break
         
-        # Validate we have minimum required data
-        if len(throttle_data) < 5:
-            raise HTTPException(status_code=400, detail="Insufficient throttle data points (need at least 5)")
+        if found_soc_column:
+            soc_data = pd.to_numeric(df[found_soc_column], errors='coerce').dropna().tolist()
         
-        # Get immediate prediction using feature extraction
+        # Validate minimum data
+        if len(throttle_data) < 5:
+            raise HTTPException(status_code=400, detail="Insufficient throttle data points")
+        
+        # Get prediction using SAME feature extraction as training
         prediction_result = scorer.predict_range(throttle_data, current_data, temp_data, soc_data)
         
-        # 2. Start background upload & retrain (don't wait for this)
+        # Background processing
         if drive_manager and not retraining_in_progress:
             background_tasks.add_task(upload_and_retrain_background, file.filename, content)
             logger.info(f"Started background processing for {file.filename}")
         
-        # 3. Return immediate response
         return {
             "prediction": prediction_result,
             "file_processing": {
                 "filename": file.filename,
                 "status": "processed_and_saved", 
                 "background_training": True,
-                "message": "File saved to Google Drive, model improving in background",
-                "columns_found": {
-                    "throttle": throttle_col,
-                    "current": "found" if current_data else "not found",
-                    "temperature": "found" if temp_data else "not found", 
-                    "soc": "found" if soc_data else "not found"
-                }
+                "message": "File saved to Google Drive, model improving in background"
             },
             "timestamp": datetime.now().isoformat(),
             "status": "success"
@@ -922,6 +924,7 @@ async def smart_process(background_tasks: BackgroundTasks, file: UploadFile = Fi
 if __name__ == "__main__":
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
