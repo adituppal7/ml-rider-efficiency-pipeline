@@ -396,44 +396,44 @@ class AdvancedRiderEfficiencyScorer:
         
         return training_info
 
-def predict_range(self, throttle_data: List[float],
-                 current_data: Optional[List[float]] = None,
-                 cell_temp_delta_data: Optional[List[float]] = None,
-                 soc_data: Optional[List[float]] = None) -> Dict[str, Any]:
-    """Predict range from ride data."""
-    if self.model is None:
-        raise ValueError("Model not loaded")
-    
-    # 1. Extract ALL features (41 features)
-    features = self.extract_features(throttle_data, current_data, cell_temp_delta_data, soc_data)
-    
-    # 2. Convert to DataFrame with ALL features
-    feature_df = pd.DataFrame([features])
-    
-    # 3. Reindex to match the scaler's expected features (from training)
-    feature_df = feature_df.reindex(columns=self.scaler.feature_names_in_, fill_value=0)
-    
-    # 4. Scale ALL features
-    features_scaled = self.scaler.transform(feature_df)
-    
-    # 5. Apply feature selection to get the 10 selected features
-    if self.feature_selector is not None:
-        features_selected = self.feature_selector.transform(features_scaled)
-    else:
-        features_selected = features_scaled
-    
-    # 6. Make prediction
-    prediction = self.model.predict(features_selected)[0]
-    confidence = min(100, max(0, 85))
-    
-    return {
-        "predicted_range": round(float(prediction), 2),
-        "confidence": round(confidence, 2),
-        "model_type": self.model_type,
-        "features_analyzed": len(features),
-        "data_points": len(throttle_data),
-        "last_training": self.last_training_time
-    }
+    def predict_range(self, throttle_data: List[float],
+                     current_data: Optional[List[float]] = None,
+                     cell_temp_delta_data: Optional[List[float]] = None,
+                     soc_data: Optional[List[float]] = None) -> Dict[str, Any]:
+        """Predict range from ride data."""
+        if self.model is None:
+            raise ValueError("Model not loaded")
+        
+        # 1. Extract ALL features (41 features)
+        features = self.extract_features(throttle_data, current_data, cell_temp_delta_data, soc_data)
+        
+        # 2. Convert to DataFrame with ALL features
+        feature_df = pd.DataFrame([features])
+        
+        # 3. Reindex to match the scaler's expected features (from training)
+        feature_df = feature_df.reindex(columns=self.scaler.feature_names_in_, fill_value=0)
+        
+        # 4. Scale ALL features
+        features_scaled = self.scaler.transform(feature_df)
+        
+        # 5. Apply feature selection to get the 10 selected features
+        if self.feature_selector is not None:
+            features_selected = self.feature_selector.transform(features_scaled)
+        else:
+            features_selected = features_scaled
+        
+        # 6. Make prediction
+        prediction = self.model.predict(features_selected)[0]
+        confidence = min(100, max(0, 85))
+        
+        return {
+            "predicted_range": round(float(prediction), 2),
+            "confidence": round(confidence, 2),
+            "model_type": self.model_type,
+            "features_analyzed": len(features),
+            "data_points": len(throttle_data),
+            "last_training": self.last_training_time
+        }
 
 class GoogleDriveManager:
     """Manages Google Drive operations for training data."""
@@ -1063,6 +1063,7 @@ async def retrain_with_multiple_files(file_paths: List[str], filenames: List[str
 if __name__ == "__main__":
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
