@@ -912,7 +912,7 @@ async def smart_process(background_tasks: BackgroundTasks, file: UploadFile = Fi
         
         # Background processing
         if drive_manager and not retraining_in_progress:
-            background_tasks.add_task(upload_and_retrain_background, file.filename, content)
+            background_tasks.add_task(retrain-model-background)
             logger.info(f"Started background processing for {file.filename}")
         
         return {
@@ -1063,6 +1063,7 @@ async def retrain_with_multiple_files(file_paths: List[str], filenames: List[str
 if __name__ == "__main__":
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
