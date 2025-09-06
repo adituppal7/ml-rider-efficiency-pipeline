@@ -921,9 +921,69 @@ async def smart_process(background_tasks: BackgroundTasks, file: UploadFile = Fi
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/retrain-only")
+async def retrain_only(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Retrain model with uploaded file (no Google Drive storage)."""
+    global retraining_in_progress
+    
+    if retraining_in_progress:
+        raise HTTPException(status_code=429, detail="Retraining already in progress")
+    
+    try:
+        # Read the uploaded file
+        content = await file.read()
+        
+        # Save to temporary file for processing
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
+        temp_file.write(content)
+        temp_file.close()
+        
+        # Start background retraining with just this file
+        background_tasks.add_task(retrain_with_single_file, temp_file.name, file.filename)
+        retraining_in_progress = True
+        
+        return {
+            "status": "success",
+            "message": f"Retraining started with {file.filename}",
+            "note": "Model will be updated with this data only"
+        }
+        
+    except Exception as e:
+        logger.error(f"Retrain-only error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def retrain_with_single_file(file_path: str, filename: str):
+    """Retrain model with single file."""
+    global retraining_in_progress, scorer
+    
+    try:
+        logger.info(f"Starting retraining with {filename}")
+        
+        # Build dataset from single file
+        training_df = scorer.build_training_dataset_from_files([file_path])
+        
+        if training_df.empty:
+            logger.error("No valid training data found")
+            return
+        
+        # Retrain model
+        training_info = scorer.retrain_model(training_df)
+        
+        # Clean up temp file
+        os.unlink(file_path)
+        
+        logger.info(f"Retraining completed: {training_info}")
+        
+    except Exception as e:
+        logger.error(f"Retraining failed: {e}")
+    finally:
+        retraining_in_progress = False
+
+
 if __name__ == "__main__":
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
