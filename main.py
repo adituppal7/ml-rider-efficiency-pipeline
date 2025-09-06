@@ -979,10 +979,80 @@ async def retrain_with_single_file(file_path: str, filename: str):
     finally:
         retraining_in_progress = False
 
+@app.post("/bulk-retrain")
+async def bulk_retrain(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
+    """Retrain model with multiple uploaded files at once."""
+    global retraining_in_progress
+    
+    if retraining_in_progress:
+        raise HTTPException(status_code=429, detail="Retraining already in progress")
+    
+    try:
+        # Save all uploaded files temporarily
+        temp_files = []
+        filenames = []
+        
+        for file in files:
+            # Create temp file
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
+            content = await file.read()
+            temp_file.write(content)
+            temp_file.close()
+            
+            temp_files.append(temp_file.name)
+            filenames.append(file.filename)
+        
+        # Start retraining with all files
+        background_tasks.add_task(retrain_with_multiple_files, temp_files, filenames)
+        retraining_in_progress = True
+        
+        return {
+            "status": "success",
+            "message": f"Bulk retraining started with {len(files)} files",
+            "files": filenames,
+            "note": "Model will be trained on all uploaded files"
+        }
+        
+    except Exception as e:
+        logger.error(f"Bulk retrain error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def retrain_with_multiple_files(file_paths: List[str], filenames: List[str]):
+    """Retrain model with multiple files."""
+    global retraining_in_progress, scorer
+    
+    try:
+        logger.info(f"Starting bulk retraining with {len(file_paths)} files")
+        
+        # Build dataset from all files
+        training_df = scorer.build_training_dataset_from_files(file_paths)
+        
+        if training_df.empty:
+            logger.error("No valid training data found in uploaded files")
+            return
+        
+        # Retrain model with all data
+        training_info = scorer.retrain_model(training_df)
+        
+        # Clean up temp files
+        for file_path in file_paths:
+            try:
+                os.unlink(file_path)
+            except:
+                pass
+        
+        logger.info(f"Bulk retraining completed: {training_info}")
+        
+    except Exception as e:
+        logger.error(f"Bulk retraining failed: {e}")
+    finally:
+        retraining_in_progress = False
+
 
 if __name__ == "__main__":
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
