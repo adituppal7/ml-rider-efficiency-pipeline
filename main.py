@@ -129,7 +129,7 @@ class TursoManager:
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
     async def save_analysis(self, analysis_data: dict) -> str:
-        """Save analysis results to database."""
+    """Save analysis results to database."""
         try:
             query = """
             INSERT INTO analysis_results 
@@ -139,16 +139,23 @@ class TursoManager:
             """
             
             # Convert numpy types to Python types for JSON serialization
+            def safe_convert(value):
+                if value is None:
+                    return None
+                if hasattr(value, 'item'):  # NumPy scalar
+                    return value.item()
+                return value
+    
             params = [
-                analysis_data.get('filename'),
-                float(analysis_data.get('predicted_range', 0)),
-                float(analysis_data.get('confidence', 0)),
-                analysis_data.get('model_type'),
-                int(analysis_data.get('features_analyzed', 0)),
-                int(analysis_data.get('data_points', 0)),
-                float(analysis_data.get('throttle_avg', 0)),
-                float(analysis_data.get('soc_start', 0)),
-                float(analysis_data.get('soc_end', 0))
+                safe_convert(analysis_data.get('filename')),
+                safe_convert(analysis_data.get('predicted_range')),
+                safe_convert(analysis_data.get('confidence')),
+                safe_convert(analysis_data.get('model_type')),
+                safe_convert(analysis_data.get('features_analyzed')),
+                safe_convert(analysis_data.get('data_points')),
+                safe_convert(analysis_data.get('throttle_avg')),
+                safe_convert(analysis_data.get('soc_start')),
+                safe_convert(analysis_data.get('soc_end'))
             ]
             
             result = await self.execute_query(query, params)
@@ -619,6 +626,7 @@ async def retrain_background():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
