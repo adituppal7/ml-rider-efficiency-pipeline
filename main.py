@@ -138,16 +138,17 @@ class TursoManager:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             """
             
+            # Convert numpy types to Python types for JSON serialization
             params = [
                 analysis_data.get('filename'),
-                analysis_data.get('predicted_range'),
-                analysis_data.get('confidence'),
+                float(analysis_data.get('predicted_range', 0)),
+                float(analysis_data.get('confidence', 0)),
                 analysis_data.get('model_type'),
-                analysis_data.get('features_analyzed'),
-                analysis_data.get('data_points'),
-                analysis_data.get('throttle_avg'),
-                analysis_data.get('soc_start'),
-                analysis_data.get('soc_end')
+                int(analysis_data.get('features_analyzed', 0)),
+                int(analysis_data.get('data_points', 0)),
+                float(analysis_data.get('throttle_avg', 0)),
+                float(analysis_data.get('soc_start', 0)),
+                float(analysis_data.get('soc_end', 0))
             ]
             
             result = await self.execute_query(query, params)
@@ -618,6 +619,7 @@ async def retrain_background():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
