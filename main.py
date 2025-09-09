@@ -128,7 +128,7 @@ class TursoManager:
             logger.error(f"Turso query error: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
-   async def save_analysis(self, analysis_data: dict) -> str:
+    async def save_analysis(self, analysis_data: dict) -> str:
         """Save analysis results to database."""
         try:
             query = """
@@ -198,12 +198,8 @@ class TursoManager:
         except Exception as e:
             logger.error(f"Failed to save analysis: {e}")
             logger.error(f"Result structure: {result}")  # Add this for debugging
-            raise HTTPException(status_code=500, detail="Failed to save analysis")
+            raise HTTPException(status_code=500, detail="Failed to save analysis")   
                         
-            except Exception as e:
-                logger.error(f"Failed to save analysis: {e}")
-                raise HTTPException(status_code=500, detail="Failed to save analysis")
-    
     async def create_tables(self):
         """Create tables if they don't exist."""
         try:
@@ -653,6 +649,7 @@ async def retrain_background():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
