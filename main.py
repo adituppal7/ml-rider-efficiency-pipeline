@@ -12,7 +12,6 @@ from contextlib import asynccontextmanager
 import logging
 from datetime import datetime
 import tempfile
-import aiomysql
 import boto3
 from botocore.exceptions import ClientError
 from sklearn.model_selection import train_test_split
@@ -668,6 +667,7 @@ async def retrain_background():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
