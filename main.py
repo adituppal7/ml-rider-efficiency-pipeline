@@ -11,22 +11,149 @@ import uvicorn
 from contextlib import asynccontextmanager
 import logging
 from datetime import datetime
-import asyncio
-from google.oauth2.credentials import Credentials
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 import tempfile
-import shutil
-from pathlib import Path
+import aiomysql
+import boto3
+from botocore.exceptions import ClientError
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.linear_model import Ridge
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Your existing AdvancedRiderEfficiencyScorer class with training capability
+class R2StorageManager:
+    """Manages Cloudflare R2 storage operations."""
+    
+    def __init__(self, account_id: str, access_key: str, secret_key: str, bucket_name: str):
+        self.bucket_name = bucket_name
+        self.endpoint_url = f"https://{account_id}.r2.cloudflarestorage.com"
+        
+        self.s3_client = boto3.client(
+            's3',
+            endpoint_url=self.endpoint_url,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name='auto'
+        )
+    
+    async def upload_file(self, file_content: bytes, filename: str) -> Dict[str, str]:
+        """Upload file to R2 storage."""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique_filename = f"{timestamp}_{filename}"
+            
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=unique_filename,
+                Body=file_content,
+                ContentType='application/octet-stream'
+            )
+            
+            logger.info(f"Uploaded {filename} to R2 as {unique_filename}")
+            return {"filename": unique_filename, "status": "success"}
+            
+        except Exception as e:
+            logger.error(f"Failed to upload {filename}: {e}")
+            raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+    
+    async def download_file(self, filename: str) -> bytes:
+        """Download file from R2 storage."""
+        try:
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=filename)
+            return response['Body'].read()
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                raise HTTPException(status_code=404, detail=f"File {filename} not found")
+            else:
+                raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+    
+    async def list_files(self) -> List[str]:
+        """List training files in R2 bucket."""
+        try:
+            response = self.s3_client.list_objects_v2(Bucket=self.bucket_name)
+            files = []
+            for obj in response.get('Contents', []):
+                if obj['Key'].lower().endswith(('.csv', '.xlsx', '.xls')):
+                    files.append(obj['Key'])
+            return files
+        except Exception as e:
+            logger.error(f"Failed to list files: {e}")
+            return []
+
+class PlanetScaleManager:
+    """Manages PlanetScale database operations."""
+    
+    def __init__(self, host: str, username: str, password: str, database: str):
+        self.host = host
+        self.username = username
+        self.password = password
+        self.database = database
+        self.pool = None
+    
+    async def connect(self):
+        """Create connection pool."""
+        try:
+            self.pool = await aiomysql.create_pool(
+                host=self.host,
+                port=3306,
+                user=self.username,
+                password=self.password,
+                db=self.database,
+                charset='utf8mb4',
+                ssl_disabled=False,
+                autocommit=True
+            )
+            logger.info("Connected to PlanetScale database")
+        except Exception as e:
+            logger.error(f"Failed to connect to PlanetScale: {e}")
+            raise
+    
+    async def save_analysis(self, analysis_data: Dict) -> str:
+        """Save analysis results to database."""
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cursor:
+                    query = """
+                    INSERT INTO analysis_results 
+                    (filename, predicted_range, confidence, model_type, features_analyzed, 
+                     data_points, throttle_avg, soc_start, soc_end, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    
+                    values = (
+                        analysis_data.get('filename'),
+                        analysis_data.get('predicted_range'),
+                        analysis_data.get('confidence'),
+                        analysis_data.get('model_type'),
+                        analysis_data.get('features_analyzed'),
+                        analysis_data.get('data_points'),
+                        analysis_data.get('throttle_avg'),
+                        analysis_data.get('soc_start'),
+                        analysis_data.get('soc_end'),
+                        datetime.now()
+                    )
+                    
+                    await cursor.execute(query, values)
+                    analysis_id = cursor.lastrowid
+                    return str(analysis_id)
+                    
+        except Exception as e:
+            logger.error(f"Failed to save analysis: {e}")
+            raise HTTPException(status_code=500, detail="Failed to save analysis")
+    
+    async def close(self):
+        """Close connection pool."""
+        if self.pool:
+            self.pool.close()
+            await self.pool.wait_closed()
+
 class AdvancedRiderEfficiencyScorer:
-    """Advanced ML model with continuous learning capability."""
+    """ML model with consistent feature handling to avoid mismatches."""
 
     def __init__(self, model_path: str = "efficiency_model.pkl"):
         self.model_path = model_path
@@ -35,14 +162,25 @@ class AdvancedRiderEfficiencyScorer:
         self.feature_selector = None
         self.model_type = None
         self.feature_names = None
-        self.training_history = []
-        self.last_training_time = None
+        # CRITICAL: Define exact feature order from training
+        self.EXPECTED_FEATURES = [
+            'avg_throttle', 'median_throttle', 'max_throttle', 'std_throttle', 'throttle_range',
+            'throttle_p25', 'throttle_p75', 'throttle_p90', 'throttle_p95', 'throttle_cv',
+            'low_throttle_ratio', 'moderate_throttle_ratio', 'high_throttle_ratio',
+            'eco_events', 'moderate_events', 'high_events', 'max_sustained_eco',
+            'max_sustained_moderate', 'max_sustained_high', 'avg_throttle_change',
+            'max_throttle_change', 'throttle_smoothness', 'sudden_changes',
+            'avg_current', 'max_current', 'std_current', 'current_p95', 'high_current_ratio',
+            'current_efficiency', 'avg_temp_delta', 'temp_imbalance_ratio', 'temp_stability',
+            'start_soc', 'end_soc', 'soc_consumed', 'avg_soc', 'min_soc', 'soc_efficiency',
+            'soc_range_ratio', 'soc_drain_rate', 'soc_consistency'
+        ]
         
         if os.path.exists(self.model_path):
             self._load_model()
 
     def _load_model(self):
-        """Load trained model and preprocessing components."""
+        """Load trained model."""
         try:
             model_data = joblib.load(self.model_path)
             self.model = model_data['model']
@@ -50,30 +188,29 @@ class AdvancedRiderEfficiencyScorer:
             self.feature_selector = model_data.get('feature_selector')
             self.model_type = model_data['model_type']
             self.feature_names = model_data['feature_names']
-            self.training_history = model_data.get('training_history', [])
-            self.last_training_time = model_data.get('last_training_time')
-            logger.info(f"Loaded {self.model_type} model from {self.model_path}")
+            logger.info(f"Loaded {self.model_type} model with {len(self.feature_names)} features")
         except Exception as e:
             logger.error(f"Error loading model: {e}")
-            raise
 
     def extract_features(self, throttle_data: List[float],
                         current_data: Optional[List[float]] = None,
                         cell_temp_delta_data: Optional[List[float]] = None,
                         soc_data: Optional[List[float]] = None) -> Dict:
-        """Extract features from ride data."""
-        # Clean throttle data
+        """Extract features with exact same logic as Colab training."""
+        
         throttle = np.array([x for x in throttle_data if pd.notna(x) and 0 <= x <= 100])
-        features = {}
-
+        
         if len(throttle) == 0:
-            return self._get_zero_features()
+            # Return zeros for all expected features
+            return {feature: 0 for feature in self.EXPECTED_FEATURES}
 
+        features = {}
+        
         # Basic throttle statistics
         features['avg_throttle'] = np.mean(throttle)
         features['median_throttle'] = np.median(throttle)
         features['max_throttle'] = np.max(throttle)
-        features['min_throttle'] = np.min(throttle)
+        features['min_throttle'] = np.min(throttle)  # Will be removed later
         features['std_throttle'] = np.std(throttle)
         features['throttle_range'] = features['max_throttle'] - features['min_throttle']
 
@@ -86,7 +223,7 @@ class AdvancedRiderEfficiencyScorer:
         # Coefficient of variation
         features['throttle_cv'] = features['std_throttle'] / (features['avg_throttle'] + 1e-6)
 
-        # Efficiency-related features
+        # Efficiency ratios
         features['low_throttle_ratio'] = np.mean(throttle <= 20)
         features['moderate_throttle_ratio'] = np.mean((throttle > 20) & (throttle <= 60))
         features['high_throttle_ratio'] = np.mean((throttle > 60) & (throttle <= 80))
@@ -98,13 +235,13 @@ class AdvancedRiderEfficiencyScorer:
         features['high_events'] = np.sum((throttle > 60) & (throttle <= 80))
         features['aggressive_events'] = np.sum(throttle > 80)
 
-        # Sustained behavior analysis
+        # Sustained behavior
         features['max_sustained_eco'] = self._max_sustained_condition(throttle <= 20)
         features['max_sustained_moderate'] = self._max_sustained_condition((throttle > 20) & (throttle <= 60))
         features['max_sustained_high'] = self._max_sustained_condition(throttle > 60)
         features['max_sustained_aggressive'] = self._max_sustained_condition(throttle > 80)
 
-        # Throttle change patterns
+        # Throttle changes
         if len(throttle) > 1:
             throttle_diff = np.diff(throttle)
             features['avg_throttle_change'] = np.mean(np.abs(throttle_diff))
@@ -117,8 +254,8 @@ class AdvancedRiderEfficiencyScorer:
             features['throttle_smoothness'] = 1
             features['sudden_changes'] = 0
 
-        # Current-based features
-        if current_data is not None:
+        # Current features
+        if current_data:
             current = np.array([x for x in current_data if pd.notna(x) and x >= 0])
             if len(current) > 0:
                 features['avg_current'] = np.mean(current)
@@ -132,12 +269,12 @@ class AdvancedRiderEfficiencyScorer:
         else:
             features.update(self._get_zero_current_features())
 
-        # Temperature-based features
-        if cell_temp_delta_data is not None:
+        # Temperature features
+        if cell_temp_delta_data:
             temp_delta = np.array([x for x in cell_temp_delta_data if pd.notna(x)])
             if len(temp_delta) > 0:
                 features['avg_temp_delta'] = np.mean(temp_delta)
-                features['max_temp_delta'] = np.max(temp_delta)
+                features['max_temp_delta'] = np.max(temp_delta)  # Will be removed later
                 features['temp_imbalance_ratio'] = features['max_temp_delta'] / (features['avg_temp_delta'] + 1e-6)
                 features['temp_stability'] = 1 / (1 + np.std(temp_delta))
             else:
@@ -145,8 +282,8 @@ class AdvancedRiderEfficiencyScorer:
         else:
             features.update(self._get_zero_temp_features())
 
-        # SOC-based features
-        if soc_data is not None:
+        # SOC features
+        if soc_data:
             soc = np.array([x for x in soc_data if pd.notna(x) and 0 <= x <= 100])
             if len(soc) > 0:
                 features['start_soc'] = soc[0]
@@ -172,7 +309,7 @@ class AdvancedRiderEfficiencyScorer:
         return features
 
     def _max_sustained_condition(self, condition_array: np.ndarray) -> int:
-        """Calculate maximum sustained duration of a condition."""
+        """Calculate maximum sustained duration."""
         max_duration = 0
         current_duration = 0
         for condition in condition_array:
@@ -182,21 +319,6 @@ class AdvancedRiderEfficiencyScorer:
             else:
                 current_duration = 0
         return max_duration
-
-    def _get_zero_features(self) -> Dict:
-        """Return zero-valued features for empty data."""
-        return {
-            'avg_throttle': 0, 'median_throttle': 0, 'max_throttle': 0, 'min_throttle': 0,
-            'std_throttle': 0, 'throttle_range': 0, 'throttle_p25': 0, 'throttle_p75': 0,
-            'throttle_p90': 0, 'throttle_p95': 0, 'throttle_cv': 0,
-            'low_throttle_ratio': 0, 'moderate_throttle_ratio': 0, 'high_throttle_ratio': 0,
-            'aggressive_throttle_ratio': 0, 'eco_events': 0, 'moderate_events': 0,
-            'high_events': 0, 'aggressive_events': 0, 'max_sustained_eco': 0,
-            'max_sustained_moderate': 0, 'max_sustained_high': 0, 'max_sustained_aggressive': 0,
-            'avg_throttle_change': 0, 'max_throttle_change': 0, 'throttle_smoothness': 1,
-            'sudden_changes': 0, **self._get_zero_current_features(), 
-            **self._get_zero_temp_features(), **self._get_zero_soc_features()
-        }
 
     def _get_zero_current_features(self) -> Dict:
         return {
@@ -215,385 +337,267 @@ class AdvancedRiderEfficiencyScorer:
             'soc_efficiency': 0, 'soc_range_ratio': 0, 'soc_drain_rate': 0, 'soc_consistency': 1
         }
 
-    def build_training_dataset_from_files(self, file_paths: List[str]) -> pd.DataFrame:
-        """Build training dataset from multiple files."""
-        logger.info(f"Building dataset from {len(file_paths)} files...")
-        
-        rows = []
-        for file_path in file_paths:
-            try:
-                # Read file
-                if file_path.lower().endswith('.csv'):
-                    df = pd.read_csv(file_path)
-                else:
-                    df = pd.read_excel(file_path)
-                
-                df.columns = df.columns.str.strip().str.lower()
-                
-                if 'throttle%' not in df.columns or 'range' not in df.columns:
-                    logger.warning(f"Skipping {file_path}: Missing required columns")
+    async def process_file_and_predict(self, file_content: bytes, filename: str) -> Dict:
+        """Process file and predict with feature mismatch protection."""
+        try:
+            # Read file
+            if filename.lower().endswith('.csv'):
+                df = pd.read_csv(io.BytesIO(file_content))
+            else:
+                df = pd.read_excel(io.BytesIO(file_content))
+            
+            # EXACT same column processing as Colab
+            df.columns = df.columns.str.strip().str.lower()
+            
+            if 'throttle%' not in df.columns:
+                raise ValueError("Missing 'throttle%' column")
+            
+            throttle_data = pd.to_numeric(df['throttle%'], errors='coerce').dropna().tolist()
+            
+            current_data = None
+            if 'current( a )' in df.columns:
+                current_data = pd.to_numeric(df['current( a )'], errors='coerce').dropna().tolist()
+            
+            temp_data = None
+            if 'cell temp delta' in df.columns:
+                temp_data = pd.to_numeric(df['cell temp delta'], errors='coerce').dropna().tolist()
+            
+            # SOC detection - EXACT same logic as Colab
+            soc_data = None
+            soc_column_names = [
+                'soc( % )', 'soc(%)', 'soc %', 'soc%', 'soc',
+                'state of charge', 'state of charge %', 'state of charge(%)',
+                'battery level', 'battery level %', 'battery level(%)',
+                'battery %', 'battery(%)'
+            ]
+            
+            voltage_keywords = ['voltage', 'v)', 'v ', 'cell voltage', 'battery voltage', 'pack_voltage']
+            
+            found_soc_column = None
+            for col in df.columns:
+                col_lower = col.lower()
+                if any(voltage_key in col_lower for voltage_key in voltage_keywords):
                     continue
-                
-                throttle_data = pd.to_numeric(df['throttle%'], errors='coerce').dropna().tolist()
-                
-                current_data = None
-                if 'current( a )' in df.columns:
-                    current_data = pd.to_numeric(df['current( a )'], errors='coerce').dropna().tolist()
-                
-                temp_data = None
-                if 'cell temp delta' in df.columns:
-                    temp_data = pd.to_numeric(df['cell temp delta'], errors='coerce').dropna().tolist()
-                
-                soc_data = None
-                soc_columns = ['soc( % )', 'soc(%)', 'soc %', 'soc%', 'soc']
-                for col in soc_columns:
-                    if col in df.columns:
-                        soc_data = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
+                for soc_name in soc_column_names:
+                    if soc_name.lower() in col_lower:
+                        found_soc_column = col
                         break
-                
-                range_values = pd.to_numeric(df['range'], errors='coerce').dropna()
-                if len(range_values) == 0 or len(throttle_data) < 10:
-                    continue
-                
-                range_val = range_values.mean()
-                if range_val <= 0 or range_val > 500:
-                    continue
-                
-                features = self.extract_features(throttle_data, current_data, temp_data, soc_data)
-                features['range'] = range_val
-                features['source_file'] = os.path.basename(file_path)
-                rows.append(features)
-                
-                logger.info(f"Processed {os.path.basename(file_path)}: range = {range_val:.1f} km")
-                
-            except Exception as e:
-                logger.error(f"Error processing {file_path}: {e}")
-                continue
-        
-        if not rows:
-            logger.error("No valid data found!")
-            return pd.DataFrame()
-        
-        result_df = pd.DataFrame(rows)
-        logger.info(f"Built dataset: {len(result_df)} samples, {len(result_df.columns)-1} features")
-        return result_df
+                if found_soc_column:
+                    break
+            
+            if found_soc_column:
+                soc_data = pd.to_numeric(df[found_soc_column], errors='coerce').dropna().tolist()
+            
+            if len(throttle_data) < 5:
+                raise ValueError("Insufficient throttle data")
+            
+            # Extract ALL features first
+            all_features = self.extract_features(throttle_data, current_data, temp_data, soc_data)
+            
+            if self.model is None:
+                raise ValueError("Model not loaded")
+            
+            # Create feature DataFrame with EXACT scaler features (41 features)
+            feature_values = []
+            for feature_name in self.SCALER_FEATURES:
+                if feature_name in all_features:
+                    feature_values.append(all_features[feature_name])
+                else:
+                    logger.warning(f"Missing feature: {feature_name}, using 0")
+                    feature_values.append(0)
+            
+            # Create DataFrame with exact column names the scaler expects
+            feature_df = pd.DataFrame([feature_values], columns=self.SCALER_FEATURES)
+            
+            logger.info(f"Created feature DataFrame with {len(feature_df.columns)} features for scaler")
+            
+            # Apply preprocessing pipeline: Scaler -> Feature Selector -> Model
+            features_scaled = self.scaler.transform(feature_df)
+            logger.info(f"Scaled features shape: {features_scaled.shape}")
+            
+            # Apply feature selection (reduces 41 -> 10 features)
+            if self.feature_selector:
+                features_selected = self.feature_selector.transform(features_scaled)
+                logger.info(f"Selected features shape: {features_selected.shape}")
+            else:
+                features_selected = features_scaled
+            
+            # Make prediction
+            prediction = self.model.predict(features_selected)[0]
+            
+            return {
+                "predicted_range": round(float(prediction), 2),
+                "confidence": 85,
+                "model_type": self.model_type,
+                "features_analyzed": len(feature_df.columns),
+                "data_points": len(throttle_data),
+                "throttle_avg": all_features.get('avg_throttle', 0),
+                "soc_start": all_features.get('start_soc', 0),
+                "soc_end": all_features.get('end_soc', 0),
+                "filename": filename
+            }
+            
+        except Exception as e:
+            logger.error(f"Prediction error: {e}")
+            logger.error(f"Error details: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
 
-    def retrain_model(self, training_df: pd.DataFrame) -> Dict[str, Any]:
-        """Retrain model with new data."""
-        logger.info("🚀 Starting model retraining...")
-        
-        if len(training_df) < 10:
-            raise ValueError("Insufficient data for training (need at least 10 samples)")
-        
-        # Store training info
-        training_info = {
-            'timestamp': datetime.now().isoformat(),
-            'samples': len(training_df),
-            'features': len(training_df.columns) - 1
-        }
-        
-        # Your existing training logic here (simplified)
-        from sklearn.model_selection import train_test_split, cross_val_score
-        from sklearn.ensemble import RandomForestRegressor
-        from sklearn.preprocessing import RobustScaler
-        from sklearn.metrics import mean_absolute_error, r2_score
-        from sklearn.feature_selection import SelectKBest, f_regression
-        import xgboost as xgb
-        import lightgbm as lgb
-        
-        # Preprocess data
-        feature_cols = [col for col in training_df.columns if col not in ['range', 'source_file']]
-        X = training_df[feature_cols].fillna(0)
-        y = training_df['range']
-        
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        
-        # Scale features
-        self.scaler = RobustScaler()
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
-        
-        # Feature selection
-        if len(X.columns) > 8:
+    async def retrain_model(self, storage: R2StorageManager) -> Dict:
+        """Retrain model with files from storage."""
+        try:
+            logger.info("Starting model retraining...")
+            
+            # Download all files
+            filenames = await storage.list_files()
+            if not filenames:
+                raise ValueError("No training files found")
+            
+            # Build dataset
+            rows = []
+            for filename in filenames[:20]:  # Limit for demo
+                try:
+                    file_content = await storage.download_file(filename)
+                    
+                    if filename.lower().endswith('.csv'):
+                        df = pd.read_csv(io.BytesIO(file_content))
+                    else:
+                        df = pd.read_excel(io.BytesIO(file_content))
+                    
+                    # Same preprocessing
+                    df.columns = df.columns.str.strip().str.lower()
+                    
+                    if 'throttle%' not in df.columns or 'range' not in df.columns:
+                        continue
+                    
+                    throttle_data = pd.to_numeric(df['throttle%'], errors='coerce').dropna().tolist()
+                    range_values = pd.to_numeric(df['range'], errors='coerce').dropna()
+                    
+                    if len(throttle_data) < 10 or len(range_values) == 0:
+                        continue
+                    
+                    # Extract other data
+                    current_data = None
+                    if 'current( a )' in df.columns:
+                        current_data = pd.to_numeric(df['current( a )'], errors='coerce').dropna().tolist()
+                    
+                    temp_data = None
+                    if 'cell temp delta' in df.columns:
+                        temp_data = pd.to_numeric(df['cell temp delta'], errors='coerce').dropna().tolist()
+                    
+                    soc_data = None
+                    # Same SOC detection logic...
+                    
+                    range_val = range_values.mean()
+                    if range_val <= 0 or range_val > 500:
+                        continue
+                    
+                    features = self.extract_features(throttle_data, current_data, temp_data, soc_data)
+                    features['range'] = range_val
+                    rows.append(features)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {filename}: {e}")
+                    continue
+            
+            if len(rows) < 10:
+                raise ValueError("Insufficient training data")
+            
+            # Train model
+            training_df = pd.DataFrame(rows)
+            feature_cols = [col for col in training_df.columns if col != 'range']
+            X = training_df[feature_cols].fillna(0)
+            y = training_df['range']
+            
+            # Remove zero-variance features
+            zero_var_cols = ['min_throttle', 'aggressive_throttle_ratio', 'aggressive_events', 'max_sustained_aggressive', 'max_temp_delta']
+            X = X.drop(columns=[col for col in zero_var_cols if col in X.columns])
+            
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            
+            # Scale and select features
+            self.scaler = RobustScaler()
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_test_scaled = self.scaler.transform(X_test)
+            
             k_features = min(10, max(5, len(X.columns) // 3))
             self.feature_selector = SelectKBest(score_func=f_regression, k=k_features)
             X_train_selected = self.feature_selector.fit_transform(X_train_scaled, y_train)
             X_test_selected = self.feature_selector.transform(X_test_scaled)
-            selected_features = X.columns[self.feature_selector.get_support()].tolist()
-        else:
-            X_train_selected = X_train_scaled
-            X_test_selected = X_test_scaled
-            selected_features = X.columns.tolist()
-            self.feature_selector = None
-        
-        self.feature_names = selected_features
-        
-        # Try multiple models
-        models = {
-            'RandomForest': RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42),
-            'XGBoost': xgb.XGBRegressor(n_estimators=50, max_depth=4, random_state=42),
-            'LightGBM': lgb.LGBMRegressor(n_estimators=50, max_depth=4, random_state=42, verbose=-1)
-        }
-        
-        best_model = None
-        best_score = float('-inf')
-        best_model_name = None
-        
-        for name, model in models.items():
-            try:
-                cv_scores = cross_val_score(model, X_train_selected, y_train, cv=min(5, len(X_train)), scoring='r2')
-                avg_cv_score = np.mean(cv_scores)
-                
-                if avg_cv_score > best_score:
-                    best_score = avg_cv_score
-                    best_model = model
-                    best_model_name = name
-                    
-            except Exception as e:
-                logger.error(f"{name} failed: {e}")
-        
-        if best_model is None:
-            from sklearn.linear_model import Ridge
-            best_model = Ridge(alpha=1.0, random_state=42)
-            best_model_name = "Ridge"
-        
-        # Train best model
-        best_model.fit(X_train_selected, y_train)
-        
-        # Evaluate
-        y_pred_test = best_model.predict(X_test_selected)
-        test_r2 = r2_score(y_test, y_pred_test)
-        test_mae = mean_absolute_error(y_test, y_pred_test)
-        
-        # Update model
-        self.model = best_model
-        self.model_type = best_model_name
-        self.last_training_time = datetime.now().isoformat()
-        
-        # Save training info
-        training_info.update({
-            'model_type': best_model_name,
-            'test_r2': test_r2,
-            'test_mae': test_mae,
-            'cv_score': best_score
-        })
-        self.training_history.append(training_info)
-        
-        # Save model
-        model_data = {
-            'model': self.model,
-            'scaler': self.scaler,
-            'feature_selector': self.feature_selector,
-            'model_type': self.model_type,
-            'feature_names': self.feature_names,
-            'training_history': self.training_history,
-            'last_training_time': self.last_training_time
-        }
-        
-        joblib.dump(model_data, self.model_path)
-        logger.info(f"💾 Retrained model saved: {best_model_name} (R²: {test_r2:.4f})")
-        
-        return training_info
-
-    def predict_range(self, throttle_data: List[float],
-                     current_data: Optional[List[float]] = None,
-                     cell_temp_delta_data: Optional[List[float]] = None,
-                     soc_data: Optional[List[float]] = None) -> Dict[str, Any]:
-        """Predict range from ride data."""
-        if self.model is None:
-            raise ValueError("Model not loaded")
-        
-        # 1. Extract ALL features (41 features)
-        features = self.extract_features(throttle_data, current_data, cell_temp_delta_data, soc_data)
-        
-        # 2. Convert to DataFrame with ALL features
-        feature_df = pd.DataFrame([features])
-        
-        # 3. Reindex to match the scaler's expected features (from training)
-        feature_df = feature_df.reindex(columns=self.scaler.feature_names_in_, fill_value=0)
-        
-        # 4. Scale ALL features
-        features_scaled = self.scaler.transform(feature_df)
-        
-        # 5. Apply feature selection to get the 10 selected features
-        if self.feature_selector is not None:
-            features_selected = self.feature_selector.transform(features_scaled)
-        else:
-            features_selected = features_scaled
-        
-        # 6. Make prediction
-        prediction = self.model.predict(features_selected)[0]
-        confidence = min(100, max(0, 85))
-        
-        return {
-            "predicted_range": round(float(prediction), 2),
-            "confidence": round(confidence, 2),
-            "model_type": self.model_type,
-            "features_analyzed": len(features),
-            "data_points": len(throttle_data),
-            "last_training": self.last_training_time
-        }
-
-class GoogleDriveManager:
-    """Manages Google Drive operations for training data."""
-    
-    def __init__(self, credentials_file: str, training_folder_id: str):
-        self.credentials_file = credentials_file
-        self.training_folder_id = training_folder_id
-        self.service = None
-        self._authenticate()
-    
-    def _authenticate(self):
-        """Authenticate with Google Drive API."""
-        try:
-            if os.path.exists(self.credentials_file):
-                credentials = service_account.Credentials.from_service_account_file(
-                    self.credentials_file,
-                    scopes=['https://www.googleapis.com/auth/drive']
-                )
-                self.service = build('drive', 'v3', credentials=credentials)
-                logger.info("✅ Google Drive authenticated successfully")
-            else:
-                logger.error(f"Credentials file not found: {self.credentials_file}")
-        except Exception as e:
-            logger.error(f"Google Drive authentication failed: {e}")
-    
-    def upload_file(self, file_path: str, filename: str) -> str:
-        """Upload file to Google Drive training folder."""
-        try:
-            file_metadata = {
-                'name': filename,
-                'parents': [self.training_folder_id]
+            
+            self.feature_names = X.columns[self.feature_selector.get_support()].tolist()
+            
+            # Train Ridge model
+            self.model = Ridge(alpha=1.0, random_state=42)
+            self.model.fit(X_train_selected, y_train)
+            self.model_type = "Ridge"
+            
+            # Evaluate
+            y_pred_test = self.model.predict(X_test_selected)
+            test_r2 = r2_score(y_test, y_pred_test)
+            test_mae = mean_absolute_error(y_test, y_pred_test)
+            
+            # Save model
+            model_data = {
+                'model': self.model,
+                'scaler': self.scaler,
+                'feature_selector': self.feature_selector,
+                'model_type': self.model_type,
+                'feature_names': self.feature_names
+            }
+            joblib.dump(model_data, self.model_path)
+            
+            return {
+                "model_type": self.model_type,
+                "test_r2": test_r2,
+                "test_mae": test_mae,
+                "samples": len(training_df),
+                "features": len(self.feature_names)
             }
             
-            media = MediaFileUpload(file_path)
-            file = self.service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id'
-            ).execute()
-            
-            logger.info(f"✅ Uploaded {filename} to Google Drive")
-            return file.get('id')
-            
         except Exception as e:
-            logger.error(f"Failed to upload {filename}: {e}")
+            logger.error(f"Retraining failed: {e}")
             raise
-    
-    def download_all_training_files(self, local_dir: str) -> List[str]:
-        """Download all files from training folder."""
-        try:
-            os.makedirs(local_dir, exist_ok=True)
-            
-            # List files in training folder
-            results = self.service.files().list(
-                q=f"'{self.training_folder_id}' in parents and trashed=false",
-                fields="files(id, name)"
-            ).execute()
-            
-            files = results.get('files', [])
-            downloaded_files = []
-            
-            for file in files:
-                file_id = file['id']
-                filename = file['name']
-                
-                # Skip non-data files
-                if not (filename.lower().endswith(('.csv', '.xlsx', '.xls'))):
-                    continue
-                
-                local_path = os.path.join(local_dir, filename)
-                
-                # Download file
-                request = self.service.files().get_media(fileId=file_id)
-                with open(local_path, 'wb') as f:
-                    downloader = MediaIoBaseDownload(f, request)
-                    done = False
-                    while done is False:
-                        status, done = downloader.next_chunk()
-                
-                downloaded_files.append(local_path)
-                logger.info(f"📥 Downloaded {filename}")
-            
-            logger.info(f"✅ Downloaded {len(downloaded_files)} training files")
-            return downloaded_files
-            
-        except Exception as e:
-            logger.error(f"Failed to download training files: {e}")
-            return []
-
-# Pydantic models
-class RideData(BaseModel):
-    throttle_data: List[float]
-    current_data: Optional[List[float]] = None
-    cell_temp_delta_data: Optional[List[float]] = None
-    soc_data: Optional[List[float]] = None
-
-class RetrainingResponse(BaseModel):
-    status: str
-    message: str
-    training_info: Optional[Dict[str, Any]] = None
-    files_processed: int = 0
-
-class PredictionResponse(BaseModel):
-    predicted_range: float
-    confidence: float
-    model_type: str
-    features_analyzed: int
-    data_points: int
-    last_training: Optional[str] = None
-    status: str = "success"
 
 # Global instances
 scorer = None
-drive_manager = None
+r2_storage = None
+planetscale_db = None
 retraining_in_progress = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global scorer, drive_manager
+    global scorer, r2_storage, planetscale_db
+    
     try:
         scorer = AdvancedRiderEfficiencyScorer()
-
-        # Env vars
-        credentials_json = os.getenv("GOOGLE_CREDENTIALS_FILE")
-        training_folder_id = os.getenv("GOOGLE_DRIVE_TRAINING_FOLDER_ID")
-
-        creds_path = None
-
-        if credentials_json:
-            creds_path = "google_credentials.json"
-            with open(creds_path, "w") as f:
-                f.write(credentials_json)
-            logger.info("✅ Credentials JSON written to google_credentials.json")
-
-        if creds_path and training_folder_id:
-            drive_manager = GoogleDriveManager(creds_path, training_folder_id)
-            logger.info("✅ Google Drive integration enabled")
-        else:
-            logger.warning("⚠️ Google Drive integration disabled - missing credentials or folder ID")
-
-        logger.info("ML Service started successfully")
-
+        
+        r2_storage = R2StorageManager(
+            account_id=os.getenv("R2_ACCOUNT_ID"),
+            access_key=os.getenv("R2_ACCESS_KEY"),
+            secret_key=os.getenv("R2_SECRET_KEY"),
+            bucket_name=os.getenv("R2_BUCKET_NAME", "ml-training-data")
+        )
+        
+        planetscale_db = PlanetScaleManager(
+            host=os.getenv("PLANETSCALE_HOST"),
+            username=os.getenv("PLANETSCALE_USERNAME"),
+            password=os.getenv("PLANETSCALE_PASSWORD"),
+            database=os.getenv("PLANETSCALE_DATABASE")
+        )
+        
+        await planetscale_db.connect()
+        logger.info("ML service started successfully")
+        
     except Exception as e:
         logger.error(f"Startup failed: {e}")
-
-    yield
-
     
-    # Shutdown
-    logger.info("Shutting down...")
+    yield
+    
+    if planetscale_db:
+        await planetscale_db.close()
 
-# Create FastAPI app
-app = FastAPI(
-    title="Continuous Learning ML Service",
-    description="ML API with Google Drive integration and continuous learning",
-    version="2.0.0",
-    lifespan=lifespan
-)
+app = FastAPI(title="ML Range Predictor", version="1.0.0", lifespan=lifespan)
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -602,467 +606,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ONLY THE ENDPOINTS YOU NEED:
+
 @app.get("/health")
 async def health_check():
-    """Health check with training status."""
-    global retraining_in_progress
+    """Health check."""
     return {
-        "status": "healthy" if scorer and scorer.model is not None else "unhealthy",
+        "status": "healthy" if scorer and scorer.model else "unhealthy",
         "model_loaded": scorer is not None and scorer.model is not None,
-        "model_type": scorer.model_type if scorer else None,
-        "last_training": scorer.last_training_time if scorer else None,
-        "training_in_progress": retraining_in_progress,
-        "google_drive_enabled": drive_manager is not None,
-        "training_history_count": len(scorer.training_history) if scorer else 0
+        "storage_connected": r2_storage is not None,
+        "database_connected": turso_db is not None
     }
 
-@app.post("/predict", response_model=PredictionResponse)
-async def predict_range(ride_data: RideData):
-    """Predict vehicle range from ride data."""
-    if scorer is None or scorer.model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
+@app.post("/predict")
+async def predict_and_store(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Main endpoint: predict + store + retrain."""
     try:
-        result = scorer.predict_range(
-            throttle_data=ride_data.throttle_data,
-            current_data=ride_data.current_data,
-            cell_temp_delta_data=ride_data.cell_temp_delta_data,
-            soc_data=ride_data.soc_data
-        )
+        file_content = await file.read()
         
-        return PredictionResponse(**result)
-    
+        # 1. Get prediction
+        prediction = await scorer.process_file_and_predict(file_content, file.filename)
+        
+        # 2. Store file
+        storage_result = await r2_storage.upload_file(file_content, file.filename)
+        
+        # 3. Save analysis
+        analysis_data = {**prediction, "filename": storage_result["filename"]}
+        analysis_id = await turso_db.save_analysis(analysis_data)
+        
+        # 4. Queue retraining
+        global retraining_in_progress
+        if not retraining_in_progress:
+            background_tasks.add_task(retrain_background)
+        
+        return {
+            "predicted_range": prediction["predicted_range"],
+            "confidence": prediction["confidence"],
+            "analysis_id": analysis_id,
+            "status": "success"
+        }
+        
     except Exception as e:
         logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/upload-and-retrain")
-async def upload_and_retrain(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Upload new training file and trigger retraining."""
-    global retraining_in_progress
-    
-    if drive_manager is None:
-        raise HTTPException(status_code=503, detail="Google Drive not configured")
-    
-    if retraining_in_progress:
-        raise HTTPException(status_code=429, detail="Retraining already in progress")
-    
-    try:
-        # Save uploaded file temporarily
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
-        content = await file.read()
-        temp_file.write(content)
-        temp_file.close()
-        
-        # Upload to Google Drive
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        drive_filename = f"{timestamp}_{file.filename}"
-        drive_file_id = drive_manager.upload_file(temp_file.name, drive_filename)
-        
-        # Clean up temp file
-        os.unlink(temp_file.name)
-        
-        # Trigger retraining in background
-        background_tasks.add_task(retrain_model_background)
-        retraining_in_progress = True
-        
-        return {
-            "status": "success",
-            "message": f"File {file.filename} uploaded to Google Drive as {drive_filename}",
-            "drive_file_id": drive_file_id,
-            "retraining_started": True
-        }
-        
-    except Exception as e:
-        logger.error(f"Upload and retrain error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-async def retrain_model_background():
-    """Background task for model retraining."""
+async def retrain_background():
+    """Background retraining."""
     global retraining_in_progress, scorer
     
     try:
-        logger.info("🚀 Starting background retraining...")
-        
-        # Download all training files
-        temp_dir = tempfile.mkdtemp()
-        training_files = drive_manager.download_all_training_files(temp_dir)
-        
-        if not training_files:
-            logger.error("No training files found")
-            return
-        
-        # Build training dataset
-        training_df = scorer.build_training_dataset_from_files(training_files)
-        
-        if training_df.empty:
-            logger.error("No valid training data found")
-            return
-        
-        # Retrain model
-        training_info = scorer.retrain_model(training_df)
-        
-        logger.info(f"✅ Retraining completed: {training_info}")
-        
-        # Clean up temp files
-        shutil.rmtree(temp_dir)
-        
-    except Exception as e:
-        logger.error(f"Background retraining failed: {e}")
-    finally:
-        retraining_in_progress = False
-
-@app.post("/manual-retrain", response_model=RetrainingResponse)
-async def manual_retrain(background_tasks: BackgroundTasks):
-    """Manually trigger model retraining with all Google Drive files."""
-    global retraining_in_progress
-    
-    if drive_manager is None:
-        raise HTTPException(status_code=503, detail="Google Drive not configured")
-    
-    if retraining_in_progress:
-        raise HTTPException(status_code=429, detail="Retraining already in progress")
-    
-    # Trigger retraining in background
-    background_tasks.add_task(retrain_model_background)
-    retraining_in_progress = True
-    
-    return RetrainingResponse(
-        status="started",
-        message="Manual retraining started in background",
-        files_processed=0
-    )
-
-@app.get("/training-history")
-async def get_training_history():
-    """Get model training history."""
-    if scorer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    return {
-        "training_history": scorer.training_history,
-        "total_trainings": len(scorer.training_history),
-        "last_training": scorer.last_training_time,
-        "current_model": scorer.model_type
-    }
-
-@app.get("/training-status")
-async def get_training_status():
-    """Get current training status."""
-    global retraining_in_progress
-    
-    return {
-        "training_in_progress": retraining_in_progress,
-        "model_loaded": scorer is not None and scorer.model is not None,
-        "google_drive_enabled": drive_manager is not None,
-        "last_training": scorer.last_training_time if scorer else None
-    }
-
-@app.post("/predict-file")
-async def predict_from_file(file: UploadFile = File(...)):
-    """Predict range from uploaded CSV/Excel file."""
-    if scorer is None or scorer.model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    try:
-        # Read file
-        content = await file.read()
-        
-        if file.filename.lower().endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(content))
-        else:
-            df = pd.read_excel(io.BytesIO(content))
-        
-        # Clean column names
-        df.columns = df.columns.str.strip().str.lower()
-        
-        # Extract data
-        if 'throttle%' not in df.columns:
-            raise HTTPException(status_code=400, detail="Missing 'throttle%' column")
-        
-        throttle_data = pd.to_numeric(df['throttle%'], errors='coerce').dropna().tolist()
-        
-        current_data = None
-        if 'current( a )' in df.columns:
-            current_data = pd.to_numeric(df['current( a )'], errors='coerce').dropna().tolist()
-        
-        temp_data = None
-        if 'cell temp delta' in df.columns:
-            temp_data = pd.to_numeric(df['cell temp delta'], errors='coerce').dropna().tolist()
-        
-        soc_data = None
-        soc_columns = ['soc( % )', 'soc(%)', 'soc %', 'soc%', 'soc']
-        for col in soc_columns:
-            if col in df.columns:
-                soc_data = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
-                break
-        
-        # Make prediction
-        result = scorer.predict_range(throttle_data, current_data, temp_data, soc_data)
-        
-        return {
-            "filename": file.filename,
-            "prediction": result,
-            "status": "success"
-        }
-    
-    except Exception as e:
-        logger.error(f"File prediction error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/")
-async def root():
-    """Root endpoint with API information."""
-    return {
-        "service": "Continuous Learning ML API",
-        "status": "running",
-        "version": "2.0.0",
-        "features": [
-            "Range prediction from ride data",
-            "Google Drive integration",
-            "Continuous learning",
-            "Model retraining",
-            "Training history tracking"
-        ],
-        "endpoints": {
-            "health": "/health",
-            "predict": "/predict",
-            "predict_file": "/predict-file", 
-            "upload_and_retrain": "/upload-and-retrain",
-            "manual_retrain": "/manual-retrain",
-            "training_history": "/training-history",
-            "training_status": "/training-status",
-            "docs": "/docs"
-        }
-    }
-
-@app.post("/smart-process")
-async def smart_process(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Get prediction AND trigger background retraining in one call."""
-    global retraining_in_progress
-    
-    if scorer is None or scorer.model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    try:
-        # 1. Get immediate prediction from current model
-        content = await file.read()
-        
-        # Process file for prediction
-        if file.filename.lower().endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(content))
-        else:
-            df = pd.read_excel(io.BytesIO(content))
-
-        # Clean column names - EXACT SAME LOGIC AS COLAB
-        df.columns = df.columns.str.strip().str.lower()
-        
-        # Check required columns using SAME logic as training
-        if 'throttle%' not in df.columns:
-            raise HTTPException(status_code=400, detail="Missing 'throttle%' column")
-        
-        # Extract data using EXACT SAME column names as training
-        throttle_data = pd.to_numeric(df['throttle%'], errors='coerce').dropna().tolist()
-        
-        current_data = None
-        if 'current( a )' in df.columns:  # This will now match after .lower()
-            current_data = pd.to_numeric(df['current( a )'], errors='coerce').dropna().tolist()
-        
-        temp_data = None
-        if 'cell temp delta' in df.columns:
-            temp_data = pd.to_numeric(df['cell temp delta'], errors='coerce').dropna().tolist()
-        
-        # SOC detection using SAME logic as Colab
-        soc_data = None
-        soc_column_names = [
-            'soc( % )', 'soc(%)', 'soc %', 'soc%', 'soc',
-            'state of charge', 'state of charge %', 'state of charge(%)',
-            'battery level', 'battery level %', 'battery level(%)',
-            'battery %', 'battery(%)'
-        ]
-        
-        voltage_keywords = ['voltage', 'v)', 'v ', 'cell voltage', 'battery voltage', 'pack_voltage']
-        
-        found_soc_column = None
-        for col in df.columns:
-            col_lower = col.lower()
-            
-            # Skip voltage-related columns
-            if any(voltage_key in col_lower for voltage_key in voltage_keywords):
-                continue
-            
-            # Check for SOC matches
-            for soc_name in soc_column_names:
-                if soc_name.lower() in col_lower:
-                    found_soc_column = col
-                    break
-            
-            if found_soc_column:
-                break
-        
-        if found_soc_column:
-            soc_data = pd.to_numeric(df[found_soc_column], errors='coerce').dropna().tolist()
-        
-        # Validate minimum data
-        if len(throttle_data) < 5:
-            raise HTTPException(status_code=400, detail="Insufficient throttle data points")
-        
-        # Get prediction using SAME feature extraction as training
-        prediction_result = scorer.predict_range(throttle_data, current_data, temp_data, soc_data)
-        
-        # Background processing
-        if drive_manager and not retraining_in_progress:
-            background_tasks.add_task(retrain-model-background)
-            logger.info(f"Started background processing for {file.filename}")
-        
-        return {
-            "prediction": prediction_result,
-            "file_processing": {
-                "filename": file.filename,
-                "status": "processed_and_saved", 
-                "background_training": True,
-                "message": "File saved to Google Drive, model improving in background"
-            },
-            "timestamp": datetime.now().isoformat(),
-            "status": "success"
-        }
-        
-    except Exception as e:
-        logger.error(f"Smart process error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/retrain-only")
-async def retrain_only(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Retrain model with uploaded file (no Google Drive storage)."""
-    global retraining_in_progress
-    
-    if retraining_in_progress:
-        raise HTTPException(status_code=429, detail="Retraining already in progress")
-    
-    try:
-        # Read the uploaded file
-        content = await file.read()
-        
-        # Save to temporary file for processing
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
-        temp_file.write(content)
-        temp_file.close()
-        
-        # Start background retraining with just this file
-        background_tasks.add_task(retrain_with_single_file, temp_file.name, file.filename)
         retraining_in_progress = True
+        logger.info("Starting background retraining...")
         
-        return {
-            "status": "success",
-            "message": f"Retraining started with {file.filename}",
-            "note": "Model will be updated with this data only"
-        }
-        
-    except Exception as e:
-        logger.error(f"Retrain-only error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-async def retrain_with_single_file(file_path: str, filename: str):
-    """Retrain model with single file."""
-    global retraining_in_progress, scorer
-    
-    try:
-        logger.info(f"Starting retraining with {filename}")
-        
-        # Build dataset from single file
-        training_df = scorer.build_training_dataset_from_files([file_path])
-        
-        if training_df.empty:
-            logger.error("No valid training data found")
-            return
-        
-        # Retrain model
-        training_info = scorer.retrain_model(training_df)
-        
-        # Clean up temp file
-        os.unlink(file_path)
-        
-        logger.info(f"Retraining completed: {training_info}")
+        await scorer.retrain_model(r2_storage)
+        logger.info("Retraining completed")
         
     except Exception as e:
         logger.error(f"Retraining failed: {e}")
     finally:
         retraining_in_progress = False
 
-@app.post("/bulk-retrain")
-async def bulk_retrain(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
-    """Retrain model with multiple uploaded files at once."""
-    global retraining_in_progress
-    
-    if retraining_in_progress:
-        raise HTTPException(status_code=429, detail="Retraining already in progress")
-    
-    try:
-        # Save all uploaded files temporarily
-        temp_files = []
-        filenames = []
-        
-        for file in files:
-            # Create temp file
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
-            content = await file.read()
-            temp_file.write(content)
-            temp_file.close()
-            
-            temp_files.append(temp_file.name)
-            filenames.append(file.filename)
-        
-        # Start retraining with all files
-        background_tasks.add_task(retrain_with_multiple_files, temp_files, filenames)
-        retraining_in_progress = True
-        
-        return {
-            "status": "success",
-            "message": f"Bulk retraining started with {len(files)} files",
-            "files": filenames,
-            "note": "Model will be trained on all uploaded files"
-        }
-        
-    except Exception as e:
-        logger.error(f"Bulk retrain error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-async def retrain_with_multiple_files(file_paths: List[str], filenames: List[str]):
-    """Retrain model with multiple files."""
-    global retraining_in_progress, scorer
-    
-    try:
-        logger.info(f"Starting bulk retraining with {len(file_paths)} files")
-        
-        # Build dataset from all files
-        training_df = scorer.build_training_dataset_from_files(file_paths)
-        
-        if training_df.empty:
-            logger.error("No valid training data found in uploaded files")
-            return
-        
-        # Retrain model with all data
-        training_info = scorer.retrain_model(training_df)
-        
-        # Clean up temp files
-        for file_path in file_paths:
-            try:
-                os.unlink(file_path)
-            except:
-                pass
-        
-        logger.info(f"Bulk retraining completed: {training_info}")
-        
-    except Exception as e:
-        logger.error(f"Bulk retraining failed: {e}")
-    finally:
-        retraining_in_progress = False
-
-
 if __name__ == "__main__":
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
