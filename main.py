@@ -161,8 +161,20 @@ class TursoManager:
             result = await self.execute_query(query, params)
             
             # Get the inserted row ID from Turso response
+            # Get the inserted row ID from Turso response
             if result.get('results') and len(result['results']) > 0:
-                last_insert_rowid = result['results'][0].get('meta', {}).get('last_insert_rowid')
+                first_result = result['results'][0]
+                
+                # Handle case where first_result might be a list or dict
+                if isinstance(first_result, dict):
+                    last_insert_rowid = first_result.get('meta', {}).get('last_insert_rowid')
+                elif isinstance(first_result, list) and len(first_result) > 0:
+                    # If it's a list, try to get meta from the first item
+                    meta_info = first_result[0] if isinstance(first_result[0], dict) else None
+                    last_insert_rowid = meta_info.get('last_insert_rowid') if meta_info else None
+                else:
+                    last_insert_rowid = None
+                    
                 if last_insert_rowid:
                     logger.info(f"Saved analysis with ID: {last_insert_rowid}")
                     return str(last_insert_rowid)
@@ -626,6 +638,7 @@ async def retrain_background():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
