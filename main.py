@@ -129,7 +129,7 @@ class TursoManager:
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
     async def save_analysis(self, analysis_data: dict) -> str:
-    """Save analysis results to database."""
+        """Save analysis results to database."""
         try:
             query = """
             INSERT INTO analysis_results 
@@ -626,6 +626,7 @@ async def retrain_background():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
