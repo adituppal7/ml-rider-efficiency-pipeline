@@ -160,44 +160,14 @@ class TursoManager:
             
             result = await self.execute_query(query, params)
             
-            # Get the inserted row ID from Turso response
-            last_insert_rowid = None
-            
-            if result.get('results'):
-                results = result['results']
-                
-                # Check if results is a list and has at least one item
-                if isinstance(results, list) and len(results) > 0:
-                    first_result = results[0]
-                    
-                    # Handle different response structures
-                    if isinstance(first_result, dict):
-                        # Direct dict access
-                        last_insert_rowid = first_result.get('meta', {}).get('last_insert_rowid')
-                    elif isinstance(first_result, list):
-                        # If it's a nested list, look for meta info
-                        for item in first_result:
-                            if isinstance(item, dict) and 'last_insert_rowid' in item:
-                                last_insert_rowid = item['last_insert_rowid']
-                                break
-                
-                # Alternative: check if meta is at the top level
-                if not last_insert_rowid and 'meta' in result:
-                    last_insert_rowid = result['meta'].get('last_insert_rowid')
-            
-            if last_insert_rowid:
-                logger.info(f"Saved analysis with ID: {last_insert_rowid}")
-                return str(last_insert_rowid)
-            
-            # If we can't get the ID, return a timestamp-based ID
+            # Generate a simple timestamp-based ID for logging/reference
             import time
             analysis_id = str(int(time.time()))
-            logger.info(f"Saved analysis with timestamp ID: {analysis_id}")
+            logger.info(f"Successfully saved analysis with reference ID: {analysis_id}")
             return analysis_id
                     
         except Exception as e:
             logger.error(f"Failed to save analysis: {e}")
-            logger.error(f"Result structure: {result}")  # Add this for debugging
             raise HTTPException(status_code=500, detail="Failed to save analysis")   
                         
     async def create_tables(self):
@@ -649,6 +619,7 @@ async def retrain_background():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
